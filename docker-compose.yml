@@ -1,0 +1,24 @@
+services:
+  tail-sampler:
+    build: .
+    image: tail-sampling-service:latest
+    container_name: tail-sampler
+    ports:
+      - "8080:8080"
+    environment:
+      TS_DATABASE_PATH: /data/traces.db
+      TS_IDLE_WINDOW_SECONDS: "10"
+      TS_TICK_INTERVAL_SECONDS: "1"
+      TS_SLOW_THRESHOLD_NS: "1000000000"
+      TS_SAMPLE_BUDGET_PER_MINUTE: "100"
+    volumes:
+      - sampler-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  sampler-data:
