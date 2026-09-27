@@ -47,6 +47,14 @@ Stop:
 docker compose down
 ```
 
+Find error spans across traces in a time window (see
+[`GET /api/v1/spans/errors`](#get-apiv1spanserrors--search-error-spans-across-traces)
+for details):
+
+```bash
+curl -s "http://localhost:8080/api/v1/spans/errors?start_ns=1700000000000000000&end_ns=1800000000000000000&limit=50"
+```
+
 ### Run without Docker
 
 ```bash
@@ -425,9 +433,73 @@ curl -s http://localhost:8080/api/v1/traces/abc-123/dominant-path
 | Method & path | Purpose |
 | --- | --- |
 | `GET /health` | Liveness |
+| `GET /api/v1/spans/errors` | Cross-trace error-span search (see below) |
 | `GET /api/v1/stats` | Open/pending counts, retained/dropped totals, per-minute budget usage |
 | `GET /api/v1/config` | Effective configuration and current minute bucket |
 | `POST /api/v1/admin/force-flush` | Close open traces and settle all minutes immediately |
+
+### `GET /api/v1/spans/errors` — search error spans across traces
+
+Finds individual **error spans** (not traces) regardless of the sampling
+decision — kept and dropped traces are all searchable. A span is an error span
+when, at ingest time, its `status` was `"error"` **or** its attributes carried
+a conventional error signal (`error: true`, an `exception` /
+`exception.type` key, or an HTTP `5xx` status code) — the exact same
+predicate used for trace classification.
+
+The query selects spans whose **start time** falls in the nanosecond window
+`[start_ns, end_ns)` (left-closed, right-open), optionally restricted to one
+`service`. Results are ordered by `start_ns` **descending**, then
+`trace_id` and `span_id` ascending; every row returns `trace_id`, `span_id`,
+`service` (`null` when absent), `start_ns`, `end_ns` and `status`.
+
+```bash
+curl -s "http://localhost:8080/api/v1/spans/errors?start_ns=1789716000000000000&end_ns=1789716060000000000&service=checkout&limit=50"
+```
+
+```json
+{
+  "start_ns": 1789716000000000000,
+  "end_ns": 1789716060000000000,
+  "service": "checkout",
+  "limit": 50,
+  "next_cursor": "eyJ2IjoxLCJzdGFydF9ucyI6MTc4OTcxNjA0NTEyMzAwMDAwMCwi...",
+  "spans": [
+    {
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7",
+      "service": "checkout",
+      "start_ns": 1789716045123000000,
+      "end_ns": 1789716045198000000,
+      "status": "ok"
+    }
+  ]
+}
+```
+
+(That first match has `status: "ok"` because its error was signalled through
+attributes, e.g. `"http.status_code": 503`.)
+
+**Pagination.** When more rows exist, the response carries an opaque
+`next_cursor`; pass it back unchanged to fetch the next page. The cursor
+embeds the full ordering key (`start_ns`, `trace_id`, `span_id`), so spans
+that share an identical start time are never duplicated or skipped across
+pages. It is also **bound to the query**: replaying it with a different
+`start_ns`/`end_ns` window or `service` returns `400`, as does a malformed
+cursor.
+
+```bash
+# Page 2 with the cursor from the first response
+curl -s "http://localhost:8080/api/v1/spans/errors?start_ns=1789716000000000000&end_ns=1789716060000000000&service=checkout&limit=50&cursor=eyJ2Ijox..."
+```
+
+| Parameter | Required | Notes |
+| --- | --- | --- |
+| `start_ns` | yes | Inclusive lower bound of the span-start window, epoch ns |
+| `end_ns` | yes | Exclusive upper bound; must be greater than `start_ns` (else `400`) |
+| `service` | no | Exact service name; omit for all services (spans without a service are included when omitted) |
+| `limit` | no | Page size, `1`–`500`, default `50` (out-of-range → `422`) |
+| `cursor` | no | `next_cursor` from the previous page; must match the same window and service |
 
 ### Reason codes
 
@@ -495,4 +567,7 @@ concurrent-span window detection, trace integrity checks (missing parent,
 self reference, cycles, time-boundary violations), cross-service edge
 aggregation (call counts, per-parent union durations, clipping, sorting),
 dominant-path selection (weights, tie-breaking, missing-parent roots,
-cycle/self-reference rejection) and crash recovery from SQLite.
+cycle/self-reference rejection), cross-trace error-span search (half-open
+start-time windows, service filtering, full-key cursor pagination with
+range/service binding and legacy-schema migration) and crash recovery from
+SQLite.

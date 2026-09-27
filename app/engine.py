@@ -107,6 +107,9 @@ class SamplingEngine:
                     rejected += 1
                     continue
 
+                is_error = span.status == "error" or _attrs_signal_error(
+                    span.attributes
+                )
                 inserted = self.storage.insert_span(
                     trace_id=tid,
                     span_id=span.span_id,
@@ -116,6 +119,7 @@ class SamplingEngine:
                     start_ns=start_ns,
                     end_ns=end_ns,
                     status=span.status,
+                    is_error=is_error,
                     attributes=span.attributes,
                     received_ns=received,
                 )
@@ -123,9 +127,6 @@ class SamplingEngine:
                     duplicates += 1
                     continue
 
-                is_error = span.status == "error" or _attrs_signal_error(
-                    span.attributes
-                )
                 ok = self.storage.upsert_open_trace(
                     trace_id=tid,
                     start_ns=start_ns,
@@ -465,6 +466,42 @@ class SamplingEngine:
                 "span_count": len(rows),
                 **result,
             }
+
+    def find_error_spans(
+        self,
+        *,
+        range_start_ns: int,
+        range_end_ns: int,
+        service: str | None,
+        limit: int,
+        cursor: tuple[int, str, str] | None,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Page through error spans (status/attribute error decided at ingest).
+
+        Returns the page rows and a flag telling whether at least one more row
+        follows. The lock guarantees a consistent snapshot against ingest.
+        """
+        with self._lock:
+            rows = self.storage.find_error_spans(
+                range_start_ns=range_start_ns,
+                range_end_ns=range_end_ns,
+                service=service,
+                limit=limit,
+                cursor=cursor,
+            )
+        has_more = len(rows) > limit
+        page = [
+            {
+                "trace_id": r["trace_id"],
+                "span_id": r["span_id"],
+                "service": r["service"],
+                "start_ns": r["start_ns"],
+                "end_ns": r["end_ns"],
+                "status": r["status"],
+            }
+            for r in rows[:limit]
+        ]
+        return page, has_more
 
     def stats(self) -> dict[str, Any]:
         with self._lock:

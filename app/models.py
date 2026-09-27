@@ -174,6 +174,25 @@ class DominantPathResponse(BaseModel):
     total_weight_ns: int
 
 
+class ErrorSpanItem(BaseModel):
+    trace_id: str
+    span_id: str
+    # null when the span carried no service attribute.
+    service: str | None = None
+    start_ns: int
+    end_ns: int
+    status: SpanStatus
+
+
+class ErrorSpansResponse(BaseModel):
+    start_ns: int
+    end_ns: int
+    service: str | None = None
+    limit: int
+    next_cursor: str | None = None
+    spans: list[ErrorSpanItem]
+
+
 class StatsResponse(BaseModel):
     open_traces: int
     pending_normal: int

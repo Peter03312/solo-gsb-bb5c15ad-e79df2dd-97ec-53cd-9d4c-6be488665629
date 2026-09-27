@@ -726,3 +726,60 @@ def test_service_edges_sorting_duration_desc_then_names_asc():
         ("asvc", "bsvc", 20),   # duration tie: source name ascending
         ("zsvc", "bsvc", 20),
     ]
+
+
+def test_error_span_cursor_roundtrip():
+    from app.cursors import ErrorSpanCursor, encode, decode, check_binding
+    from app.cursors import InvalidCursorError
+
+    cur = ErrorSpanCursor(
+        start_ns=100, trace_id="t", span_id="s",
+        range_start_ns=0, range_end_ns=200, service="svc-a",
+    )
+    token = encode(cur)
+    assert isinstance(token, str) and "." not in token
+    back = decode(token)
+    assert back == cur
+
+    check_binding(back, range_start_ns=0, range_end_ns=200, service="svc-a")
+    # None service round-trips distinctly from "None".
+    cur_none = ErrorSpanCursor(1, "t", "s", 0, 2, None)
+    assert decode(encode(cur_none)).service is None
+
+
+def test_error_span_cursor_rejects_garbage_and_mismatched_binding():
+    import base64
+    import json
+    import pytest
+
+    from app.cursors import decode, check_binding
+    from app.cursors import InvalidCursorError
+
+    for bad in ("", "!!!", "aGVsbG8", base64.urlsafe_b64encode(b"{}").rstrip(b"=").decode()):
+        with pytest.raises(InvalidCursorError):
+            decode(bad)
+
+    def token(payload):
+        return base64.urlsafe_b64encode(
+            json.dumps(payload).encode()
+        ).rstrip(b"=").decode()
+
+    base = {"v": 1, "start_ns": 1, "trace_id": "t", "span_id": "s",
+            "range_start_ns": 0, "range_end_ns": 2, "service": None}
+    cur = decode(token(base))
+    with pytest.raises(InvalidCursorError):
+        check_binding(cur, range_start_ns=0, range_end_ns=3, service=None)
+    with pytest.raises(InvalidCursorError):
+        check_binding(cur, range_start_ns=0, range_end_ns=2, service="svc")
+
+    for mutated in (
+        {**base, "v": 2},
+        {**base, "start_ns": "1"},
+        {**base, "start_ns": True},
+        {**base, "trace_id": ""},
+        {**base, "span_id": 7},
+        {**base, "service": 5},
+        {k: v for k, v in base.items() if k != "span_id"},
+    ):
+        with pytest.raises(InvalidCursorError):
+            decode(token(mutated))

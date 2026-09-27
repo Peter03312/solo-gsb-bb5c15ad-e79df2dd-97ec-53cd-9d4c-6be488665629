@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS spans (
     start_ns      INTEGER NOT NULL,
     end_ns        INTEGER NOT NULL,
     status        TEXT NOT NULL,
+    is_error      INTEGER NOT NULL DEFAULT 0,
     attributes_json TEXT NOT NULL DEFAULT '{}',
     received_ns   INTEGER NOT NULL,
     PRIMARY KEY (trace_id, span_id)
@@ -69,6 +70,19 @@ CREATE TABLE IF NOT EXISTS minute_counters (
 ) WITHOUT ROWID;
 """
 
+# Partial indexes serving the cross-trace error-span search, pre-ordered by
+# start_ns DESC, trace_id ASC, span_id ASC. SQLite >= 3.43 serves the whole
+# ORDER BY straight from the index; older versions ignore the DESC direction
+# but still use the index for filtering and only sort start-time ties.
+SPAN_ERROR_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_spans_error_start
+    ON spans(start_ns DESC, trace_id ASC, span_id ASC) WHERE is_error = 1;
+
+CREATE INDEX IF NOT EXISTS idx_spans_error_service_start
+    ON spans(service ASC, start_ns DESC, trace_id ASC, span_id ASC)
+    WHERE is_error = 1;
+"""
+
 
 class Storage:
     def __init__(self, path: str) -> None:
@@ -81,11 +95,42 @@ class Storage:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate_spans_error_column()
+        self.conn.executescript(SPAN_ERROR_INDEXES)
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.commit()
         self.conn.close()
+
+    def _migrate_spans_error_column(self) -> None:
+        """Add the per-span error flag to databases created before it existed.
+
+        Rows are backfilled with the same status/attribute predicate used at
+        ingest time, so historical spans follow the identical error policy.
+        """
+        cols = {
+            r["name"]
+            for r in self.conn.execute("PRAGMA table_info(spans)").fetchall()
+        }
+        if not cols or "is_error" in cols:
+            return
+        self.conn.execute(
+            "ALTER TABLE spans ADD COLUMN is_error INTEGER NOT NULL DEFAULT 0"
+        )
+        rows = self.conn.execute(
+            "SELECT trace_id, span_id, status, attributes_json FROM spans"
+        ).fetchall()
+        for r in rows:
+            is_error = r["status"] == "error" or _attrs_signal_error(
+                json.loads(r["attributes_json"] or "{}")
+            )
+            if is_error:
+                self.conn.execute(
+                    "UPDATE spans SET is_error = 1 "
+                    "WHERE trace_id = ? AND span_id = ?",
+                    (r["trace_id"], r["span_id"]),
+                )
 
     # ------------------------------------------------------------------ spans
 
@@ -100,6 +145,7 @@ class Storage:
         start_ns: int,
         end_ns: int,
         status: str,
+        is_error: bool,
         attributes: dict[str, Any],
         received_ns: int,
     ) -> bool:
@@ -108,11 +154,12 @@ class Storage:
             """
             INSERT OR IGNORE INTO spans
                 (trace_id, span_id, parent_span_id, name, service,
-                 start_ns, end_ns, status, attributes_json, received_ns)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 start_ns, end_ns, status, is_error, attributes_json, received_ns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (trace_id, span_id, parent_span_id, name, service, start_ns,
-             end_ns, status, json.dumps(attributes, separators=(",", ":")),
+             end_ns, status, int(is_error),
+             json.dumps(attributes, separators=(",", ":")),
              received_ns),
         )
         return cur.rowcount == 1
@@ -122,6 +169,51 @@ class Storage:
             "SELECT * FROM spans WHERE trace_id = ? ORDER BY start_ns",
             (trace_id,),
         )
+
+    def find_error_spans(
+        self,
+        *,
+        range_start_ns: int,
+        range_end_ns: int,
+        service: str | None,
+        limit: int,
+        cursor: tuple[int, str, str] | None,
+    ) -> list[sqlite3.Row]:
+        """Return up to ``limit + 1`` error spans ordered for key-set paging.
+
+        Ordering is ``start_ns DESC, trace_id ASC, span_id ASC`` over spans
+        whose start time lies in the half-open window
+        ``[range_start_ns, range_end_ns)``. ``cursor`` is the
+        ``(start_ns, trace_id, span_id)`` of the last previously returned row;
+        the extra row (when present) signals that another page exists.
+        """
+        where = [
+            "is_error = 1",
+            "start_ns >= ?",
+            "start_ns < ?",
+        ]
+        params: list[Any] = [range_start_ns, range_end_ns]
+        if service is not None:
+            where.append("service = ?")
+            params.append(service)
+        if cursor is not None:
+            # start_ns < cursor start, or same start with a strictly greater
+            # (trace_id, span_id) in ascending order.
+            where.append(
+                "(start_ns < ? OR (start_ns = ? AND "
+                "(trace_id > ? OR (trace_id = ? AND span_id > ?))))"
+            )
+            c_start, c_trace, c_span = cursor
+            params.extend([c_start, c_start, c_trace, c_trace, c_span])
+
+        sql = (
+            "SELECT trace_id, span_id, service, start_ns, end_ns, status "
+            "FROM spans WHERE " + " AND ".join(where) + " "
+            "ORDER BY start_ns DESC, trace_id ASC, span_id ASC "
+            "LIMIT ?"
+        )
+        params.append(limit + 1)
+        return self.conn.execute(sql, params).fetchall()
 
     # ----------------------------------------------------------------- traces
 

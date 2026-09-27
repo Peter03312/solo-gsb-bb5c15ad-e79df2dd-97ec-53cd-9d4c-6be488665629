@@ -8,6 +8,13 @@ import logging
 from fastapi import FastAPI, HTTPException, Query
 
 from .config import settings
+from .cursors import (
+    ErrorSpanCursor,
+    InvalidCursorError,
+    check_binding,
+    decode as decode_cursor,
+    encode as encode_cursor,
+)
 from .dominantpath import CyclicTraceError
 from .engine import SamplingEngine
 from .models import (
@@ -18,6 +25,8 @@ from .models import (
     ConcurrencyResponse,
     DecisionResponse,
     DominantPathResponse,
+    ErrorSpanItem,
+    ErrorSpansResponse,
     IntegrityResponse,
     ServiceEdgesResponse,
     ServiceTimeResponse,
@@ -89,6 +98,7 @@ def root() -> dict[str, str]:
         "docs": "/docs",
         "health": "/health",
         "ingest": "POST /api/v1/spans:batch",
+        "error_spans": "GET /api/v1/spans/errors?start_ns=&end_ns=",
         "decisions": "GET /api/v1/decisions/{trace_id}",
         "service_time": "GET /api/v1/traces/{trace_id}/service-time",
         "concurrency": "GET /api/v1/traces/{trace_id}/concurrency?min_active=2",
@@ -112,6 +122,87 @@ def health() -> dict[str, str]:
 def ingest_batch(req: BatchIngestRequest) -> BatchIngestResponse:
     result = get_engine().ingest(req.spans)
     return BatchIngestResponse(**result)
+
+
+@app.get(
+    "/api/v1/spans/errors",
+    response_model=ErrorSpansResponse,
+    tags=["spans"],
+    summary="Search error spans across traces by start-time window",
+)
+def find_error_spans(
+    start_ns: int = Query(
+        ..., description="Inclusive lower bound of the span start window (ns)",
+    ),
+    end_ns: int = Query(
+        ..., description="Exclusive upper bound of the span start window (ns)",
+    ),
+    service: str | None = Query(
+        default=None,
+        description="Only return spans from this service",
+    ),
+    limit: int = Query(
+        default=50, ge=1, le=500,
+        description="Maximum number of spans per page",
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description="Opaque next_cursor value returned by the previous page",
+    ),
+) -> ErrorSpansResponse:
+    if end_ns <= start_ns:
+        raise HTTPException(
+            status_code=400,
+            detail="end_ns must be greater than start_ns (window is [start, end))",
+        )
+    service = service.strip() or None if service is not None else None
+
+    page_cursor: ErrorSpanCursor | None = None
+    if cursor is not None:
+        try:
+            page_cursor = decode_cursor(cursor)
+            check_binding(
+                page_cursor,
+                range_start_ns=start_ns,
+                range_end_ns=end_ns,
+                service=service,
+            )
+        except InvalidCursorError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    seek = (
+        (page_cursor.start_ns, page_cursor.trace_id, page_cursor.span_id)
+        if page_cursor is not None
+        else None
+    )
+    rows, has_more = get_engine().find_error_spans(
+        range_start_ns=start_ns,
+        range_end_ns=end_ns,
+        service=service,
+        limit=limit,
+        cursor=seek,
+    )
+
+    next_cursor: str | None = None
+    if has_more and rows:
+        last = rows[-1]
+        next_cursor = encode_cursor(ErrorSpanCursor(
+            start_ns=last["start_ns"],
+            trace_id=last["trace_id"],
+            span_id=last["span_id"],
+            range_start_ns=start_ns,
+            range_end_ns=end_ns,
+            service=service,
+        ))
+
+    return ErrorSpansResponse(
+        start_ns=start_ns,
+        end_ns=end_ns,
+        service=service,
+        limit=limit,
+        next_cursor=next_cursor,
+        spans=[ErrorSpanItem(**row) for row in rows],
+    )
 
 
 @app.get(
